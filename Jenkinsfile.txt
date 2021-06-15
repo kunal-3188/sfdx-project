@@ -49,3 +49,4 @@ def authSF() {
     sh 'cat authjenkinsci.txt'
     echo 'end sf auth method'
 }
+}
