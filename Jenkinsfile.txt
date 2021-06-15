@@ -22,7 +22,7 @@ def salesforceDeploy() {
     if (rc2 != 0) {
        echo " 'SFDX CLI Authorization to target env has failed.'"
     }
-
+}
 def authSF() {
     echo 'SF Auth method'
     def SF_AUTH_URL
@@ -48,5 +48,4 @@ def authSF() {
     sh 'ls -l authjenkinsci.txt'
     sh 'cat authjenkinsci.txt'
     echo 'end sf auth method'
-}
 }
