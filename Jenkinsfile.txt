@@ -1,18 +1,22 @@
 #!groovy
 pipeline { 
-   agent any
-   tool { sfdx
-   }
-
-		checkout([$class: 'GitSCM', branches: [[name: '*/master']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/kunal-3188/sfdx-project.git']]])
-
-			stage ('salesforce_Deploy') {
-            		steps {
-                		authSF()
-                		salesforceDeploy()
-                		}
-            		}
+    agent any
+        stages{
+            stage('git checkout'){
+                steps{
+		        checkout([$class: 'GitSCM', branches: [[name: '*/master']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/kunal-3188/sfdx-project.git']]])
+                }
+            }
+		    stage ('salesforce_Deploy') {
+                steps {
+                authSF()
+                salesforceDeploy()
+                }
+            }
         }
+}            
+
+
 
 
 def salesforceDeploy() {
