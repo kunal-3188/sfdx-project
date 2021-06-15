@@ -4,13 +4,7 @@ pipeline {
    tool { sfdx
    }
 
-		stages {
-			stage(‘git check-out’) {
-				steps {
-					git ‘https://github.com/kunal-3188/sfdx-project.git’
-					 }
-				}
-
+		checkout([$class: 'GitSCM', branches: [[name: '*/master']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/kunal-3188/sfdx-project.git']]])
 
 			stage(‘salesforce Deploy) {
             		steps {
