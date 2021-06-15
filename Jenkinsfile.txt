@@ -6,7 +6,7 @@ pipeline {
 
 		checkout([$class: 'GitSCM', branches: [[name: '*/master']], extensions: [], userRemoteConfigs: [[url: 'https://github.com/kunal-3188/sfdx-project.git']]])
 
-			stage(‘salesforce Deploy) {
+			stage ('salesforce_Deploy') {
             		steps {
                 		authSF()
                 		salesforceDeploy()
