@@ -1,0 +1,413 @@
+#!groovy
+pipeline { 
+    agent any
+    environment {
+        AWS_REGION = 'us-east-2'
+        AWS_DEFAULT_REGION = 'us-east-2'
+        DEPLOY_LIST = ''
+    }
+    options {
+        timeout(time: 8, unit: 'HOURS')   // timeout on whole pipeline job-
+        //remove old builds. keep all builds fro.m one week old and no more than 20 builds total.
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '7', numToKeepStr: '20')
+    }
+    parameters {
+        choice(name: 'current_commit_differential',
+             choices: getDiff(),
+             description: 'Files included in current commit')
+        booleanParam(name: 'differential_only_deploy',
+            defaultValue: false,
+            description: 'Check this to run a differential_only_deploy')
+        gitParameter(branchFilter: 'origin/(.*)', defaultValue: 'master', name: 'source_branch', type: 'PT_BRANCH', description: 'Select a branch to build from')
+        choice(name: 'target_environment',
+            choices: getSFEvnParams(),
+            description: 'Select a Salesforce Org to build against')
+        booleanParam(name: 'validate_only_deploy',
+            defaultValue: true,
+            description: 'Check this to run a validate only deploy')
+        choice(name: 'test_level',
+            choices: 'NoTestRun\nRunSpecifiedTests\nRunLocalTests',
+            description: 'Set the Test Level for this Build')
+        string(name: 'specified_tests',
+            defaultValue: 'ex: ClassTest,Class2Test',
+            description: 'If Test Level is "RunSpecifiedTests" then specify a comma seperated list of test classes to run. Ex: "AccountTriggerHandlerTest,LeadTriggerHandlerTest"')
+    }
+    stages {
+        stage('start diff') {
+            steps {
+                script {
+                    startDiff()
+                }
+            }
+        }
+        stage('Bitbucket Sync Target Branch') {
+            steps {  
+                // all current build environment variables
+                echo sh(returnStdout: true, script: 'env')
+                echo "${currentBuild.buildCauses}"
+                echo "Bitbucket Sync Target Branch"
+                bitbucketCheckout()
+            }
+        }
+        stage('Salesforce Deploy') {
+            steps {
+                authSF()
+                salesforceDeploy()
+            }
+        }
+    }
+}
+def getDeployList(deployPath) {
+    node {
+        dir('bitbucket-checkout') {
+            git url:'https://nick-sansotti@bitbucket.org/nick-sansotti/test_parambuild.git',
+                credentialsId: 'bitbucket_unpw',  
+                branch: "develop"
+                //[M    Jenkinsfile
+                //M force-app/main/default/classes/AccountManager.cls]
+            output = sh(returnStdout: true, script: 'git diff-tree --no-commit-id --raw --name-status -r HEAD').replaceAll('M   ', ',')
+            echo "${output}"
+            def deployFiles = ''
+            i = 0
+            for(String s: output.split(',')) {
+                echo "${s}"
+                if(s.contains('force-app/')) {
+                    i++
+                    //deployFiles += s.replace('force-app/main/default', '') + ','
+                    deployFiles += deployPath + s + ','
+                }
+            }
+            // remove last comma
+            deployFiles = deployFiles.substring(0, deployFiles.length() - 1)
+            deployFiles = deployFiles.replace("\n", "").replace("\r", "")
+            echo "deploy list: ${deployFiles}"
+            return " ${deployFiles}"
+        }
+    }
+}
+def startDiff() {
+    
+    dir('bitbucket-checkout') {
+        git url:'https://nick-sansotti@bitbucket.org/nick-sansotti/test_parambuild.git',
+            credentialsId: 'bitbucket_unpw',  
+            branch: "develop"
+            //[M    Jenkinsfile
+            //M force-app/main/default/classes/AccountManager.cls]
+        output = sh(returnStdout: true, script: 'git diff-tree --no-commit-id --raw --name-status -r HEAD').replaceAll('M   ', ',')
+        //--diff-filter=MA
+        //output = output.replaceAll('A ', ',')
+        echo "${output}"
+        def deployFiles = ''
+        for(String s: output.split(',')) {
+            echo "${s}"
+            if(s.contains('force-app/')) {
+                deployFiles += s + ','
+            }
+        }
+        // remove last comma
+        deployFiles = deployFiles.substring(0, deployFiles.length() - 1)
+        echo "deploy list: ${deployFiles}"
+    }
+}
+def bitbucketCheckout() {
+    dir('bitbucket-checkout') {
+        // determine if the build was trigger from a git event or manually built with parameters
+        // [[_class:jenkins.branch.BranchEventCause, shortDescription:Branch event]]
+        // [[_class:hudson.model.Cause$UserIdCause, shortDescription:Started by user JenkinsAdmin, userId:jenkins_ubuntu, userName:JenkinsAdmin]]
+        if ("${currentBuild.buildCauses}".contains("UserIdCause")) {
+            echo "git checkout ${params.source_branch}"
+            git credentialsId: 'bitbucket_unpw', url:'https://nick-sansotti@bitbucket.org/nick-sansotti/test_parambuild.git', branch: "${params.source_branch}"
+        }
+        else if("${currentBuild.buildCauses}".contains("BranchEventCause")) {
+            echo "git checkout ${env.BRANCH_NAME}"
+            checkout scm
+        }
+        commitChangeset = sh(returnStdout: true, script: 'git diff-tree --no-commit-id --name-only -r HEAD').trim().tokenize(',')
+        echo "bitbucket-checkout"
+        echo "Commit Changeset Size: ${commitChangeset.size()}"
+        echo "Commit Changeset: ${commitChangeset}"
+    }
+    sh 'ls bitbucket-checkout'
+    echo "Current GIT Commit : ${env.GIT_COMMIT}"
+    echo "Previous Known Successful GIT Commit : ${env.GIT_PREVIOUS_SUCCESSFUL_COMMIT}"
+}
+def salesforceDeploy() {
+    
+    def varsfdx = tool 'sfdx'
+    rc2 = command "${varsfdx}/sfdx force:auth:sfdxurl:store -f authjenkinsci.txt -a targetEnvironment"
+    if (rc2 != 0) {
+       echo " 'SFDX CLI Authorization to target env has failed.'"
+    }
+    def TEST_LEVEL='NoTestRun'
+    def VALIDATE_ONLY = false
+    def deployBranchURL = ""
+    if("${env.BRANCH_NAME}".contains("/")) {
+        deployBranchURL = "${env.BRANCH_NAME}".replace("/", "_")
+    }
+    else {
+        deployBranchURL = "${env.BRANCH_NAME}"
+    }
+    //test update
+    def DEPLOYDIR="/var/lib/jenkins/workspace/pipeline_${deployBranchURL}/bitbucket-checkout/force-app/main/default"
+    echo DEPLOYDIR
+    def SF_INSTANCE_URL = "https://login.salesforce.com"
+    //determine if destructive package is present, deploy appropriately 
+    fileSearch = sh('find . -name destructiveChanges.xml')
+    if ("${fileSearch}".contains("./destructiveChanges.xml")) {
+        def deploy_script = "sfdx force:mdapi:deploy -d ${DEPLOYDIR}/deployment/destructivePackage --testlevel ${TEST_LEVEL} -u targetEnvironment --json -w -1"
+        // **do we need to account for test level as well in deploy+script? **        
+        rc4 = command "${varsfdx}/sfdx " + deploy_script
+        if ("$rc4".contains("0")) {
+                echo "successful sdfx mdapi deploy of destructive changes"
+            } 
+        else {
+            currentBuild.result = 'FAILURE'
+            echo "$rc4"
+        }
+    }
+    else {
+        dir("${DEPLOYDIR}") {
+            if ("${currentBuild.buildCauses}".contains("UserIdCause")) {
+                def deploy_script = "force:source:deploy --wait 10"
+                if(params.validate_only_deploy) {
+                    deploy_script += " -c"
+                }
+                if(params.differential_only_deploy) {
+                    deploy_script += " -p" + getDeployList("/var/lib/jenkins/workspace/pipeline_${deployBranchURL}/bitbucket-checkout/")
+                }
+                else {
+                    deploy_script += " --sourcepath ${DEPLOYDIR}"
+                }
+                
+                if("${params.test_level}".contains("RunSpecifiedTests")) {
+                    deploy_script += " --testlevel ${params.test_level} -r ${params.specified_tests}"
+                }
+                else {
+                    deploy_script += " --testlevel ${params.test_level}"
+                }
+                deploy_script += " -u targetEnvironment --json"
+                echo "echo deploy script"
+                echo deploy_script
+                rc4 = command "${varsfdx}/sfdx " + deploy_script
+            }
+            else if("${currentBuild.buildCauses}".contains("BranchEventCause")) {
+                if (env.CHANGE_ID == null && env.VALIDATE_ONLY == false){
+                    rc4 = command "${varsfdx}/sfdx force:source:deploy --wait 10 --sourcepath ${DEPLOYDIR} --testlevel ${TEST_LEVEL} -u targetEnvironment --json"         
+                }
+                else{
+                    rc4 = command "${varsfdx}/sfdx force:source:deploy --wait 10 --sourcepath ${DEPLOYDIR} --testlevel ${TEST_LEVEL} -u targetEnvironment --json"
+                }
+            }
+ 
+            if ("$rc4".contains("0")) {
+            
+                echo "successful sdfx source deploy, beginning release tag branch merges"
+                // moved to JenkinsfileReleaseFinish
+            
+            } 
+            else {
+            currentBuild.result = 'FAILURE'
+            echo "$rc4"
+            }
+        }
+    }
+    
+def purgeScreenshot() {
+    echo "${env.WORKSPACE}"
+    dir("${env.WORKSPACE}/Reports"){
+        echo "#################removing screenshots#################"
+        beforePurge = sh (
+            script: "ls -ltra",
+            returnStdout: true
+        )
+        echo "#########before purge##########"
+        echo "${beforePurge}"
+        "sh sudo rm -rf Screenshots"
+        afterPurge = sh (
+            script: "ls -ltra",
+            returnStdout: true
+        )
+        echo "#########after purge##########"
+        echo "${afterPurge}"        
+    }   
+}
+def authSF() {
+    echo 'SF Auth method'
+    def SF_AUTH_URL
+    echo env.BRANCH_NAME
+    if ("${currentBuild.buildCauses}".contains("UserIdCause")) {
+        def fields = env.getEnvironment()
+        fields.each {
+            key, value -> if("${key}".contains("${params.target_environment}")) { SF_AUTH_URL = "${value}"; }
+        }
+    }
+    else if("${currentBuild.buildCauses}".contains("BranchEventCause")) {
+        if(env.BRANCH_NAME == 'master' || env.CHANGE_TARGET == 'master') {
+            SF_AUTH_URL = env.SFDX_DEV
+        }
+        else { // {PR} todo - better determine if its a PR env.CHANGE_TARGET?
+            SF_AUTH_URL = env.SFDX_DEV
+        }
+    }
+    echo SF_AUTH_URL
+    writeFile file: 'authjenkinsci.txt', text: SF_AUTH_URL
+    sh 'ls -l authjenkinsci.txt'
+    sh 'cat authjenkinsci.txt'
+    echo 'end sf auth method'
+}
+def getDiff() {
+    node {
+        dir('bitbucket-checkout') {
+            git url:'https://nick-sansotti@bitbucket.org/nick-sansotti/test_parambuild.git',
+                credentialsId: 'bitbucket_unpw',  
+                branch: "develop"
+                //[M    Jenkinsfile
+                //M force-app/main/default/classes/AccountManager.cls]
+            output = sh(returnStdout: true, script: 'git diff-tree --no-commit-id --raw --name-status -r HEAD').replaceAll('M   ', ',')
+            output = output.replaceAll('A   ', ',')
+            echo "${output}"
+            def deployFiles = ''
+            i = 0
+            for(String s: output.split(',')) {
+                echo "${s}"
+                if(s.contains('force-app/')) {
+                    i++
+                    deployFiles += s.replace('force-app/main/default', '...') + ','
+                }
+            }
+            // remove last comma
+            deployFiles = deployFiles.substring(0, deployFiles.length() - 1)
+            echo "deploy list: ${deployFiles}"
+            return "${i} files (${deployFiles})"
+        }
+    }
+}
+def getSFEvnParams() {
+    def fields = env.getEnvironment()
+    def output = "";
+    fields.each {
+        key, value -> if("${key}".startsWith("SFDX_")) { output += "${key}\n"; }
+    }
+    return output;
+}
+def command(script) {
+   if (isUnix()) {
+       return sh(returnStatus: true, script: script);
+   } else {
+       return bat(returnStatus: true, script: script);
+   }
+}
+def sendSlackNotification() { 
+    if(currentBuild.currentResult != 'SUCCESS') {
+        buildSummary = "Job: ${env.JOB_NAME}\n Status: *FAILURE*\n" 
+        slackSend color : "danger", message: "${buildSummary}", channel: '#devops'
+    }
+    else{
+        buildSummary = "Job: ${env.JOB_NAME}\n Status: *SUCCESS*\n"
+        slackSend color : "good", message: "${buildSummary}", channel: '#devops'
+    }
+}
+def sendEmailNotification() {
+    BUILD_FULL = sh (
+        script: "ls --sort=time ${env.WORKSPACE}/subDir/selenium/Maven_Automation_Project/${env.WORKSPACE}/selenium/Maven_Automation_Project/src/main/java/HTML_Report/ -t | head -n 1",
+        //script: "ls --sort=time ${env.WORKSPACE}/subDir/selenium/Maven_Automation_Project${env.WORKSPACE}/selenium/Maven_Automation_Project/src/main/java/HTML_Report/ -t | head -n 1",
+        returnStdout: true
+    ).trim()
+    GIT_COMMIT_EMAIL = sh (
+        script: 'git --no-pager show -s --format=\'%ae\'',
+        returnStdout: true
+    ).trim()
+    echo "################USER EMAIL###################"  
+    echo "Git committer email: ${GIT_COMMIT_EMAIL}"
+    echo "################USER EMAIL###################"
+    //git commiter name
+    GIT_COMMIT_NAME = sh (
+        script: 'git --no-pager show -s --format=\'%an\'',
+        returnStdout: true
+    ).trim()
+    echo "################USER NAME##################"    
+    echo "Git committer name: ${GIT_COMMIT_NAME}"
+    echo "################USER NAME##################"
+    if(currentBuild.currentResult == 'SUCCESS') {
+        mail (to: "tony@sansotti.com, nick@sansotti.com",
+            subject: "Success Pipeline: ${currentBuild.fullDisplayName}",
+            body: "Success")
+            //body: "Success ${env.BUILD_URL}")
+    }
+    else {
+        mail (to: "${GIT_COMMIT_EMAIL}",
+            subject: "Success Pipeline: ${currentBuild.fullDisplayName}",
+            body: "No Selenium Run \n Jenkins Build Result: ${BUILD_URL}console")
+            //body: "Success ${env.BUILD_URL}")
+    }
+}
+def seleniumTest() {
+        
+    // TODO - check for success deploy/build to this point - 
+    // launch Selenium scripts. >
+    echo "@@@@@@@@@@@@@@@@@@@@"
+    echo "@@@@@@@@@@@@@@@@@@@@"
+    echo "Entering Testing State"
+    echo "@@@@@@@@@@@@@@@@@@@@"
+    echo "@@@@@@@@@@@@@@@@@@@@"
+    // // this variable must match name of Maven Global Tool Plugin in Jenkins
+    // def mvn_version = 'MAVEN_HOME'
+    //does not run test if branch is not qa
+    echo "*******************************"
+    echo "*******************************"
+    echo env.CHANGE_ID
+    echo "*******************************"
+    echo "*******************************"
+    if (env.CHANGE_ID == null){
+        echo "running tests..."
+        def mvn_version = 'MAVEN_HOME'
+        withEnv( ["PATH+MAVEN=${tool mvn_version}/bin"] ) {
+            dir("subDir/selenium/Maven_Automation_Project") {
+                echo 'selenium dir'
+                sh 'pwd'
+                sh 'ls -ll'
+                //sh 'mvn clean install'
+                // -e, -X above gives a more verbose log output, put log into separate file ' > log-file.log'
+                sh 'mvn test -Dsurefire.suiteXmlFiles=Regression_Test.xml'
+            }
+            // dir("selenium/Maven_Automation_Project/target") {
+            //  echo 'selenium target dir'
+            //  sh 'pwd'
+            //  sh 'ls -ll'
+            //  // sh 'java -jar Liberty_Lending_Automation-1.0-SNAPSHOT.jar'
+            // }    
+        }
+    }
+        
+    else {
+        echo "No test needed as it is a pull request creation"
+    }
+    echo "@@@@@@@@@@@@@@@@@@@@"
+    echo "@@@@@@@@@@@@@@@@@@@@"
+    echo "Test Complete"
+    echo "@@@@@@@@@@@@@@@@@@@@"
+    echo "@@@@@@@@@@@@@@@@@@@#"
+}
+def uploadFilesToS3() {
+    if (env.CHANGE_ID == null){
+        //takes credential made on jenkins global settings
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'devops-jenkins', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+            //aws command to copy html files from jenkins workspace into s3 bucket named libertylendinghtmlreports
+            echo "##########################print workspace#######################"
+            echo env.WORKSPACE
+            echo "################################################################"
+            
+            // sh "aws configure list"
+            echo "#####################entering html report folder ###############"
+            BUILD_FULL = sh (
+                script: "ls --sort=time ${env.WORKSPACE}/subDir/selenium/Maven_Automation_Project/${env.WORKSPACE}/selenium/Maven_Automation_Project/src/main/java/HTML_Report -t | head -n 1",
+                returnStdout: true
+            ).trim()
+            echo "####################BUILD_FULL#######################"
+            echo "Build full flag: ${BUILD_FULL}"
+            echo "###################BUILD FULL END####################"
+            sh "aws s3 cp ${env.WORKSPACE}/subDir/selenium/Maven_Automation_Project/${env.WORKSPACE}/selenium/Maven_Automation_Project/src/main/java/HTML_Report/${BUILD_FULL} s3://libertylendinghtmlreports/${BUILD_FULL}/${BUILD_FULL}"
+            sh "aws s3 cp ${env.WORKSPACE}/subDir/selenium/Maven_Automation_Project/var/lib/jenkins/workspace/Screenshots s3://libertylendinghtmlreports/${BUILD_FULL}/Screenshots --recursive"
+        }
+    }
+}
